@@ -1,23 +1,33 @@
 # salt_logic.py
-import re
+import regex as re
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from database import cur, conn
 
 analyzer = SentimentIntensityAnalyzer()
 
+# Precompiled global regex objects
 curse_rx = None
 insult_rx = None
 
-def build_word_boundary_regex(words: set):
+def build_fuzzy_regex(words: set, max_errors=1):
+    """
+    Build a regex pattern with fuzzy matching.
+    max_errors: number of allowed insertions, deletions, or substitutions.
+    (?b) makes it match word boundaries automatically.
+    """
     if not words:
         return None
-    pattern = r"\b(?:" + "|".join(re.escape(w) for w in sorted(words, key=len, reverse=True)) + r")\b"
+    pattern = "|".join(rf"(?b){re.escape(word)}{{e<={max_errors}}}" for word in sorted(words, key=len, reverse=True))
     return re.compile(pattern, re.IGNORECASE)
 
-def rebuild_regexes(config):
+def rebuild_regexes(config, max_errors=1):
+    """
+    Rebuild curse and insult regex patterns from the configuration.
+    Call after loading config.
+    """
     global curse_rx, insult_rx
-    curse_rx = build_word_boundary_regex(config["curse_words"])
-    insult_rx = build_word_boundary_regex(config["insult_words"])
+    curse_rx = build_fuzzy_regex(config["curse_words"], max_errors)
+    insult_rx = build_fuzzy_regex(config["insult_words"], max_errors)
 
 def today_utc_str():
     from datetime import datetime
@@ -40,6 +50,10 @@ def set_user_salt(user_id: int, value: float):
     conn.commit()
 
 def add_user_salt(user_id: int, amount: float):
+    """
+    Adds salt to a user, updates their total and daily history.
+    Only keeps **one entry per user per day**.
+    """
     date_str = today_utc_str()
     cur.execute("INSERT OR IGNORE INTO users (user_id, salt) VALUES (?, 0)", (user_id,))
     cur.execute("UPDATE users SET salt = salt + ? WHERE user_id = ?", (amount, user_id))
@@ -48,6 +62,9 @@ def add_user_salt(user_id: int, amount: float):
     conn.commit()
 
 def get_rank_for_total(total: float, config):
+    """
+    Returns the rank name for a given total salt based on thresholds.
+    """
     ranks_sorted = sorted(config["ranks"], key=lambda x: x[0], reverse=True)
     for th, name in ranks_sorted:
         if total >= float(th):
@@ -55,13 +72,22 @@ def get_rank_for_total(total: float, config):
     return "Unranked"
 
 def calculate_salt(text: str, mentions: int, config) -> float:
+    """
+    Calculate how much salt a message generates.
+    - Uses VADER sentiment
+    - Fuzzy matching for curses/insults
+    - Amplifies if message mentions other users
+    """
     scores = analyzer.polarity_scores(text)
     compound = scores["compound"]
+
     found_curse = bool(curse_rx.search(text)) if curse_rx else False
     found_insult = bool(insult_rx.search(text)) if insult_rx else False
     directed = config.get("mention_amplifies", True) and (mentions > 0)
+
     salt_inc = 0.0
     if found_curse or found_insult:
+        # Heavy salt if insult or negative directed curse
         if found_insult or (found_curse and (compound < config["negativity_threshold"] or directed)):
             salt_inc = float(config["salt_penalty_insult"])
         else:
